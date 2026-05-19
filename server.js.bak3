@@ -5,11 +5,8 @@ const fs = require("fs-extra");
 
 const app = Fastify({
   logger: true,
-  bodyLimit: 10 * 1024 * 1024
+  bodyLimit: 10 * 1024 * 1024  // 10MB，足够容纳 OCR 文本
 });
-
-app.register(require("@fastify/formbody"));
-
 const PORT = 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
 const TIMELINE_FILE = "enhanced_messages.json";
@@ -20,11 +17,15 @@ const TIMESTAMP_DB_FILE = "./message_timestamps.json";
 // ========================
 function loadTimeline() {
   if (!fs.existsSync(TIMELINE_FILE)) return [];
-  try { return fs.readJsonSync(TIMELINE_FILE); } catch { return []; }
+  try {
+    return fs.readJsonSync(TIMELINE_FILE);
+  } catch {
+    return [];
+  }
 }
 
 // ========================
-// 保存 timeline（保留 SP）
+// 保存 timeline（只保留最近 50 条，SP 永远在第一条）
 // ========================
 function saveTimeline(messages) {
   const sp = messages.find(m => m.role === "system");
@@ -38,20 +39,25 @@ function saveTimeline(messages) {
 // 提取时间戳（支持多种格式）
 // ========================
 function extractTimestamp(content) {
-  if (!content || typeof content !== "string") return null;
+  if (!content) return null;
+  if (typeof content !== "string") return null;   // 新增：跳过非字符串格式（如图片数组）
+  // 新格式：2026-05-17 00:11（可带左括号）
   let match = content.match(/（?(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
   if (match) return new Date(match[1]);
+  // 旧格式：2026-05-16 22:44（开头的）
   match = content.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
   if (match) return new Date(match[1]);
+  // 旧格式：（2026/5/16 22:44）
   match = content.match(/（(\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2})）/);
   if (match) return new Date(match[1]);
+  // 旧格式：2026/5/16 22:44（无括号）
   match = content.match(/(\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2})/);
   if (match) return new Date(match[1]);
   return null;
 }
 
 // ========================
-// 时间戳记忆库
+// 时间戳记忆库（让历史消息找回时间）
 // ========================
 function loadTimestampDB() {
   if (!fs.existsSync(TIMESTAMP_DB_FILE)) return {};
@@ -62,16 +68,19 @@ function saveTimestampDB(db) {
   fs.writeJsonSync(TIMESTAMP_DB_FILE, db, { spaces: 2 });
 }
 
+// 内容指纹：用 role + 内容前150字符
 function makeFingerprint(msg) {
   const raw = msg.content || "";
   const content = (typeof raw === "string" ? raw.trim().slice(0, 150) : "");
   return `${msg.role}::${content}`;
 }
 
+// 新增：去掉时间戳前缀后的纯内容指纹
 function makeFingerprintStripped(msg) {
   const raw = msg.content || "";
-  if (typeof raw !== "string") return `${msg.role}::`;
+  if (typeof raw !== "string") return `${msg.role}::`;  // 非字符串直接返回空指纹，不会匹配
   let content = raw.trim();
+  // 去掉开头的时间戳（各种格式）
   content = content
     .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s*/, "")
     .replace(/^\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}\s*/, "")
@@ -81,18 +90,21 @@ function makeFingerprintStripped(msg) {
   return `${msg.role}::${content}`;
 }
 
+// 带记忆的时间提取：先直接提取，否则查记忆库
 function extractTimestampWithMemory(msg, tsDB) {
   const fromContent = extractTimestamp(msg.content);
   if (fromContent) return fromContent;
+  // 先用原始内容查
   const fp = makeFingerprint(msg);
   if (tsDB[fp]) return new Date(tsDB[fp]);
+  // 再用去掉时间戳的内容查
   const fpStripped = makeFingerprintStripped(msg);
   if (tsDB[fpStripped]) return new Date(tsDB[fpStripped]);
   return null;
 }
 
 // ========================
-// 消息判断
+// 判断是否为特殊事件（Bark/NO_ACTION）
 // ========================
 function isSpecialEvent(msg) {
   if (msg.role !== "assistant") return false;
@@ -100,14 +112,23 @@ function isSpecialEvent(msg) {
   return c.includes("刚刚给宝宝发了 Bark") || c.includes("自动唤醒：本次未发送 Bark");
 }
 
+// ========================
+// 判断是否为真实对话（用于 Timeline，过滤掉 system、工具调用、<system> 规则消息）
+// ========================
 function isRealMessageForTimeline(msg) {
   if (msg.role === "system") return false;
   if (msg.tool_calls) return false;
   if (isSpecialEvent(msg)) return false;
-  if (msg.role === "user" && msg.content && typeof msg.content === "string" && msg.content.trim().startsWith("<system>")) return false;
+  // 过滤掉以 <system> 开头的 user 消息（同时跳过非字符串 content，如图片数组）
+  if (msg.role === "user" && msg.content && typeof msg.content === "string" && msg.content.trim().startsWith("<system>")) {
+    return false;
+  }
   return msg.role === "user" || msg.role === "assistant";
 }
 
+// ========================
+// 判断是否为系统规则消息（需要保留在 LLM 请求中）
+// ========================
 function isSystemRule(msg) {
   if (msg.role === "system") return true;
   if (msg.role === "user" && msg.content && typeof msg.content === "string" && msg.content.trim().startsWith("<system>")) return true;
@@ -115,16 +136,20 @@ function isSystemRule(msg) {
 }
 
 // ========================
-// 构建 Timeline
+// 构建 Timeline（核心合并逻辑）
 // ========================
 function buildTimeline(kelivoMessages, tsDB) {
   const oldTimeline = loadTimeline();
+
+  // 1. 提取最新的 SP
   const newSystemMessages = kelivoMessages.filter(msg => msg.role === "system");
   const latestSP = newSystemMessages.length > 0 ? newSystemMessages[newSystemMessages.length - 1] : null;
   const oldSP = oldTimeline.find(msg => msg.role === "system");
 
+  // 2. 真实对话（保持 Kelivo 原始顺序）
   const newRealMessages = kelivoMessages.filter(isRealMessageForTimeline);
 
+  // 3. 旧特殊事件，按时间戳升序（使用记忆库提取时间）
   const oldSpecialEvents = oldTimeline.filter(isSpecialEvent).sort((a, b) => {
     const timeA = extractTimestampWithMemory(a, tsDB);
     const timeB = extractTimestampWithMemory(b, tsDB);
@@ -132,10 +157,16 @@ function buildTimeline(kelivoMessages, tsDB) {
     return 0;
   });
 
+  // 4. 合并：将特殊事件按时间戳插入到真实对话中
   const merged = [...newRealMessages];
+
   for (const event of oldSpecialEvents) {
     const eventTime = extractTimestampWithMemory(event, tsDB);
-    if (!eventTime) { merged.push(event); continue; }
+    if (!eventTime) {
+      merged.push(event); // 无时间戳的放最后
+      continue;
+    }
+
     let inserted = false;
     for (let i = 0; i < merged.length; i++) {
       const msgTime = extractTimestampWithMemory(merged[i], tsDB);
@@ -145,9 +176,12 @@ function buildTimeline(kelivoMessages, tsDB) {
         break;
       }
     }
-    if (!inserted) merged.push(event);
+    if (!inserted) {
+      merged.push(event);
+    }
   }
 
+  // 5. 去重（按 role + content）
   const seen = new Set();
   const unique = merged.filter(msg => {
     const key = JSON.stringify({ role: msg.role, content: msg.content });
@@ -156,13 +190,18 @@ function buildTimeline(kelivoMessages, tsDB) {
     return true;
   });
 
+  // 6. 分配 position（用于存储，发给 LLM 时洗掉）
   const result = [];
-  if (latestSP) result.push({ ...latestSP, position: 0 });
-  else if (oldSP) result.push({ ...oldSP, position: 0 });
+  if (latestSP) {
+    result.push({ ...latestSP, position: 0 });
+  } else if (oldSP) {
+    result.push({ ...oldSP, position: 0 });
+  }
 
   let realPos = 1;
   const finalMessages = [];
   let pendingSpecial = [];
+
   for (const msg of unique) {
     if (isSpecialEvent(msg)) {
       pendingSpecial.push(msg);
@@ -171,7 +210,10 @@ function buildTimeline(kelivoMessages, tsDB) {
         const prevRealPos = realPos - 1;
         const step = 1 / (pendingSpecial.length + 1);
         for (let i = 0; i < pendingSpecial.length; i++) {
-          finalMessages.push({ ...pendingSpecial[i], position: parseFloat((prevRealPos + step * (i + 1)).toFixed(4)) });
+          finalMessages.push({
+            ...pendingSpecial[i],
+            position: parseFloat((prevRealPos + step * (i + 1)).toFixed(4))
+          });
         }
         pendingSpecial = [];
       }
@@ -179,10 +221,14 @@ function buildTimeline(kelivoMessages, tsDB) {
       realPos++;
     }
   }
+
   if (pendingSpecial.length > 0) {
     const lastRealPos = realPos - 1;
     for (let i = 0; i < pendingSpecial.length; i++) {
-      finalMessages.push({ ...pendingSpecial[i], position: parseFloat((lastRealPos + 0.3 * (i + 1)).toFixed(4)) });
+      finalMessages.push({
+        ...pendingSpecial[i],
+        position: parseFloat((lastRealPos + 0.3 * (i + 1)).toFixed(4))
+      });
     }
   }
 
@@ -191,34 +237,46 @@ function buildTimeline(kelivoMessages, tsDB) {
 }
 
 // ========================
-// 追加特殊事件
+// 追加特殊事件（由内部接口调用）
 // ========================
 function appendSpecialEvent(content) {
   const timeline = loadTimeline();
   let maxPos = 0;
   for (const msg of timeline) {
-    if (msg.position && msg.position > maxPos) maxPos = msg.position;
+    if (msg.position && msg.position > maxPos) {
+      maxPos = msg.position;
+    }
   }
-  const newEvent = { role: "assistant", content, position: maxPos + 0.5 };
+  const newEvent = {
+    role: "assistant",
+    content,
+    position: maxPos + 0.5
+  };
   timeline.push(newEvent);
   saveTimeline(timeline);
   console.log(`\n已记录特殊事件 (position ${newEvent.position}): ${content}\n`);
 }
 
+// ========================
+// 洗掉 position 字段（发给 LLM 时不要内部编号）
+// ========================
 function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
 
+// wake_up 心跳时间戳
 let wakeUpLastHeartbeat = null;
 
 // ========================
-// 安全：放行 /admin，其他仅本地/局域网
+// 安全：只允许本地和局域网访问（公网 IP 直接拒绝）
 // ========================
 app.addHook("onRequest", (req, reply, done) => {
-  if (req.url.startsWith("/admin")) return done();
   const ip = req.ip || req.connection.remoteAddress;
+  // 允许本地回环地址
   if (ip === "127.0.0.1" || ip === "::1" || ip === "localhost") return done();
+  // 允许私有 IP 段（10.x, 172.16-31.x, 192.168.x）
   if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip)) return done();
+  // 对于管理接口，即便公网也先放行（因为会有密码保护，但我们现在直接拒绝公网更安全）
   reply.code(403).send("Forbidden");
 });
 
@@ -233,7 +291,7 @@ app.get("/v1/models", async (req, reply) => {
 });
 
 // ========================
-// Chat Completions
+// Chat Completions（主入口）
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
   try {
@@ -246,6 +304,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const kelivoMessages = body.messages || [];
     const oldTimeline = loadTimeline();
 
+    // ===== 时间戳记忆库：扫描新消息，记录时间戳 =====
     const tsDB = loadTimestampDB();
     let tsDBDirty = false;
     for (const msg of kelivoMessages) {
@@ -255,21 +314,26 @@ app.post("/v1/chat/completions", async (req, reply) => {
       if (!ts) continue;
       const fp = makeFingerprint(msg);
       const fpStripped = makeFingerprintStripped(msg);
-      if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
-      if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
+      if (!tsDB[fp]) {
+        tsDB[fp] = ts.toISOString();
+        tsDBDirty = true;
+      }
+      // 同时存去掉时间戳后的版本，供历史消息查找
+      if (!tsDB[fpStripped]) {
+        tsDB[fpStripped] = ts.toISOString();
+        tsDBDirty = true;
+      }
     }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
+    // 构建 Timeline（传入 tsDB 用于记忆提取）
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
     saveTimeline(finalTimeline);
 
-    // 过滤图片消息，只保留纯文本
-    const llmMessages = kelivoMessages.filter(msg => {
-      if (msg.role === "system") return true;
-      if (msg.role === "tool") return true;
-      return typeof msg.content === "string";
-    });
+    // ---- 组装转发给 LLM 的 messages（原封不动 + Bark 注入） ----
+    const llmMessages = [...kelivoMessages];
 
+    // 取出旧的特殊事件（Bark/NO_ACTION），洗掉 position
     const oldEvents = stripPosition(
       oldTimeline.filter(isSpecialEvent).sort((a, b) => {
         const timeA = extractTimestampWithMemory(a, tsDB);
@@ -280,11 +344,18 @@ app.post("/v1/chat/completions", async (req, reply) => {
     );
 
     console.log("本次注入的特殊事件数量:", oldEvents.length);
-    if (oldEvents.length > 0) console.log("示例事件内容:", oldEvents[0].content.substring(0, 80));
+    if (oldEvents.length > 0) {
+      console.log("示例事件内容:", oldEvents[0].content.substring(0, 80));
+    }
 
+    // 将每个事件按时间戳插入到 llmMessages 中（使用记忆库提取时间）
     for (const event of oldEvents) {
       const eventTime = extractTimestampWithMemory(event, tsDB);
-      if (!eventTime) { llmMessages.push(event); continue; }
+      if (!eventTime) {
+        llmMessages.push(event);
+        continue;
+      }
+
       let inserted = false;
       for (let i = 0; i < llmMessages.length; i++) {
         const msgTime = extractTimestampWithMemory(llmMessages[i], tsDB);
@@ -294,78 +365,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
           break;
         }
       }
-      if (!inserted) llmMessages.push(event);
+      if (!inserted) {
+        llmMessages.push(event);
+      }
     }
 
     // 调试打印
     console.log("\n===== 转发给 LLM 的 Messages（前 10 条）=====\n");
     console.log(JSON.stringify(llmMessages.slice(0, 10), null, 2));
-
-    // ---- 自动修复不完整的 tool 调用（双向清理） ----
-    // 第一遍：标记需要移除的索引
-    const removeSet = new Set();
-
-    // 检查 assistant tool_calls 是否完整
-    for (let i = 0; i < llmMessages.length; i++) {
-      const msg = llmMessages[i];
-      if (msg.role !== "assistant" || !msg.tool_calls) continue;
-      const expectedIds = msg.tool_calls.map(tc => tc.id);
-      const followingTools = [];
-      for (let j = i + 1; j < llmMessages.length; j++) {
-        const nxt = llmMessages[j];
-        if (nxt.role === "tool") {
-          followingTools.push(nxt);
-        } else {
-          break;
-        }
-      }
-      const foundIds = followingTools.map(t => t.tool_call_id);
-      const complete = expectedIds.every(id => foundIds.includes(id));
-      if (!complete) {
-        // 标记这条 assistant 为移除，同时标记它后面的所有 tool 消息也移除
-        removeSet.add(i);
-        for (let j = i + 1; j < llmMessages.length; j++) {
-          if (llmMessages[j].role === "tool") {
-            removeSet.add(j);
-          } else {
-            break;
-          }
-        }
-        console.log(`⚠️ 自动修复：移除不完整的 tool_calls (索引 ${i})`);
-      }
-    }
-
-    // 检查孤立 tool 消息（前面没有对应的 tool_calls）
-    for (let i = 0; i < llmMessages.length; i++) {
-      if (llmMessages[i].role !== "tool") continue;
-      // 向前查找最近的 assistant
-      let hasMatchingToolCalls = false;
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = llmMessages[j];
-        if (prev.role === "assistant" && prev.tool_calls) {
-          // 检查这个 tool_call_id 是否在 assistant 的 tool_calls 中
-          const ids = prev.tool_calls.map(tc => tc.id);
-          if (ids.includes(llmMessages[i].tool_call_id)) {
-            hasMatchingToolCalls = true;
-          }
-          break;
-        } else if (prev.role === "tool") {
-          continue; // 继续向前找
-        } else {
-          break; // 遇到 user 或其他消息，停止
-        }
-      }
-      if (!hasMatchingToolCalls) {
-        removeSet.add(i);
-        console.log(`⚠️ 自动修复：移除孤立的 tool 消息 (索引 ${i})`);
-      }
-    }
-
-    // 按索引从大到小删除，避免索引错乱
-    const sortedRemove = Array.from(removeSet).sort((a, b) => b - a);
-    for (const idx of sortedRemove) {
-      llmMessages.splice(idx, 1);
-    }
 
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
@@ -377,6 +384,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
       body: JSON.stringify({ ...body, messages: llmMessages })
     });
 
+    // 流式转发
     reply.raw.writeHead(response.status, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -397,12 +405,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
 });
 
 // ========================
-// 内部接口：记录唤醒事件
+// 内部接口：记录唤醒事件（供 wake_up 调用）
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
   try {
     const { content } = req.body;
-    if (!content) return reply.code(400).send({ error: "content is required" });
+    if (!content) {
+      return reply.code(400).send({ error: "content is required" });
+    }
     appendSpecialEvent(content);
     reply.send({ success: true });
   } catch (err) {
@@ -412,7 +422,7 @@ app.post("/internal/wake-event", async (req, reply) => {
 });
 
 // ========================
-// 读取 .env 值
+// 读取 .env 文件中的值
 // ========================
 function readEnvValue(key) {
   try {
@@ -420,14 +430,16 @@ function readEnvValue(key) {
     const lines = envContent.split("\n");
     for (const line of lines) {
       const trimmed = line.trim();
-      if (trimmed.startsWith(key + "=")) return trimmed.substring(key.length + 1).trim();
+      if (trimmed.startsWith(key + "=")) {
+        return trimmed.substring(key.length + 1).trim();
+      }
     }
   } catch {}
   return process.env[key] || "";
 }
 
 // ========================
-// HTTP Basic Auth
+// HTTP Basic 认证中间件（管理页用）
 // ========================
 function basicAuth(req, reply, done) {
   const auth = req.headers.authorization || "";
@@ -437,9 +449,7 @@ function basicAuth(req, reply, done) {
     return;
   }
   const decoded = Buffer.from(encoded, "base64").toString();
-  const colonIndex = decoded.indexOf(":");
-  const user = decoded.substring(0, colonIndex);
-  const password = decoded.substring(colonIndex + 1);
+  const [user, password] = decoded.split(":");
   if (user === process.env.ADMIN_USER && password === process.env.ADMIN_PASSWORD) {
     done();
   } else {
@@ -447,9 +457,6 @@ function basicAuth(req, reply, done) {
   }
 }
 
-// ========================
-// 管理页面 GET /admin
-// ========================
 app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const serverUptime = Math.floor(process.uptime());
   const wakeUpStatus = wakeUpLastHeartbeat
@@ -461,9 +468,6 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const currentModel = readEnvValue("MODEL_NAME");
   const currentBark = readEnvValue("BARK_KEY").substring(0, 10) + "…";
   const currentIcon = readEnvValue("CUSTOM_ICON_URL");
-
-  // 生成 Basic Auth 头字符串，直接注入前端
-  const authToken = Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`).toString("base64");
 
   const html = `<!DOCTYPE html>
 <html lang="zh">
@@ -478,10 +482,8 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
     .status p { margin: 4px 0; }
     label { display: block; margin-top: 12px; font-weight: bold; }
     input { width: 100%; padding: 10px; margin-top: 4px; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
-    button { width: 100%; margin-top: 20px; padding: 12px; border: none; border-radius: 8px; font-size: 16px; }
-    button.save { background: #007aff; color: white; }
-    button.restart { background: #ff3b30; color: white; }
-    button:active { opacity: 0.8; }
+    button { width: 100%; margin-top: 20px; padding: 12px; background: #007aff; color: white; border: none; border-radius: 8px; font-size: 16px; }
+    button:active { background: #0056b3; }
     .note { margin-top: 16px; font-size: 14px; color: #888; text-align: center; }
   </style>
 </head>
@@ -502,43 +504,14 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
     <input name="bark_key" placeholder="留空不修改">
     <label>自定义图标 URL（可选）</label>
     <input name="custom_icon" value="${currentIcon}">
-    <button type="submit" class="save">保存配置</button>
+    <button type="submit">保存配置</button>
   </form>
-  <button onclick="restartServices()" class="restart">🔄 一键重启所有服务</button>
-  <div class="note">修改配置后先保存，再点红色按钮重启即可生效。</div>
-  <script>
-    const AUTH_HEADER = "Basic ${authToken}";
-    async function restartServices() {
-      if (!confirm("确定要重启 Gateway 和 wake_up 吗？")) return;
-      try {
-        const resp = await fetch("/admin/restart", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": AUTH_HEADER
-          },
-          body: "{}"
-        });
-        const result = await resp.json();
-        if (result.success) {
-          alert("✅ 重启成功！页面稍后自动刷新。");
-          setTimeout(() => location.reload(), 3000);
-        } else {
-          alert("❌ 重启失败：" + (result.error || "未知错误"));
-        }
-      } catch (e) {
-        alert("❌ 请求失败：" + e.message);
-      }
-    }
-  </script>
+  <div class="note">保存后请在终端重启 Gateway 和 wake_up 让新配置生效。</div>
 </body>
 </html>`;
   reply.type("text/html").send(html);
 });
 
-// ========================
-// 管理保存 POST /admin/save
-// ========================
 app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
   const { target_url, target_key, model_name, bark_key, custom_icon } = req.body || {};
 
@@ -554,42 +527,21 @@ ADMIN_USER=${process.env.ADMIN_USER}
 ADMIN_PASSWORD=${process.env.ADMIN_PASSWORD}
 `;
   fs.writeFileSync(".env", newEnv);
-  console.log("\n✅ .env 已更新，可通过管理页重启服务\n");
+  console.log("\n✅ .env 已更新，请手动重启服务\n");
 
   reply.type("text/html").send(`<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>已保存</title></head>
 <body style="text-align:center;font-family:-apple-system,sans-serif;padding:40px;">
   <h2>✅ 配置已保存</h2>
-  <p>现在可以返回管理页，点击重启按钮让新配置生效。</p>
+  <p>请在终端重启 Gateway 和 wake_up 让新配置生效。</p>
   <a href="/admin">← 返回设置</a>
 </body></html>`);
 });
 
-// ========================
-// 心跳接口
-// ========================
 app.post("/internal/heartbeat", async (req, reply) => {
   wakeUpLastHeartbeat = Date.now();
   reply.send({ status: "ok" });
-});
-
-// ========================
-// 管理页一键重启
-// ========================
-app.post("/admin/restart", { preHandler: basicAuth }, async (req, reply) => {
-  // 立即回复，避免重启时连接中断
-  reply.send({ success: true, output: "重启指令已发送，请稍等..." });
-  
-  // 稍后重启（使用 pm2 完整路径）
-  const { exec } = require("child_process");
-  exec("/opt/homebrew/bin/pm2 restart all", (err, stdout, stderr) => {
-    if (err) {
-      console.error("重启失败:", stderr);
-    } else {
-      console.log("服务已重启:", stdout);
-    }
-  });
 });
 
 // ========================
