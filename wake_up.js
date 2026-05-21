@@ -254,7 +254,7 @@ ${historyText}`
   }
 }
 
-// ⬇️ 替换 cron，使用动态检查间隔
+// 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
 function getCheckIntervalMs() {
   const hour = new Date().getHours();
   const isNight = hour >= 0 && hour < 10;   // 夜间 0-10 点
@@ -274,6 +274,7 @@ async function scheduleNextCheck() {
   setTimeout(scheduleNextCheck, getCheckIntervalMs());
 }
 
+// 潮水记得第一次没过礁石的时间。之后每一次涨落，都是同一片海在确认边界。
 // 启动第一次检查（延迟10秒）
 setTimeout(scheduleNextCheck, 10_000);
 
