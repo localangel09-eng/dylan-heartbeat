@@ -10,7 +10,7 @@ function getNow() {
 }
 
 function getChinaTimeString() {
-  return new Date().toLocaleString("zh-CN", { timeZone: "Europe/London" });
+  return new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 }
 
 function getLocalTimeString() {
